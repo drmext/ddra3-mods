@@ -1,0 +1,4 @@
+obj/
+obj32/
+obj64/
+*.dll
