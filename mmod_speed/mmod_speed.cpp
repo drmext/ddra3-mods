@@ -321,6 +321,10 @@ struct CoreBpmEntry {
 #define CORE_CACHE_MAX 4096
 static CoreBpmEntry g_cache[CORE_CACHE_MAX];
 static int g_cache_count;
+/* Last gameplay-parse Core — recovers Mac (mcode,diff) key mismatches. */
+static int g_play_core;
+static int g_play_max;
+static int g_play_min;
 
 struct DurBucket {
     int bpm;
@@ -457,6 +461,7 @@ static int gameplay_alive(ActorPtr gp)
 }
 
 static int clamp_i(int v, int lo, int hi); /* defined below */
+static int mcode_plausible(unsigned int mcode);
 static void refresh_online_text_buffer(void);
 static void online_hud_reset(void);
 
@@ -797,6 +802,9 @@ static void online_hud_reset(void)
         g_display_effective[p] = 0;
         g_chart_bpm_hud[p] = 0;
     }
+    g_play_core = 0;
+    g_play_max = 0;
+    g_play_min = 0;
 }
 
 static void remember_chart_bpm(int player, int chart_bpm)
@@ -1231,9 +1239,9 @@ static unsigned int mcode_from_game(void)
     }
 }
 
-static unsigned int mcode_from_player0(void)
+static unsigned int mcode_from_player(int player)
 {
-    void *po = player_obj(0);
+    void *po = player_obj(player);
     if (!po)
         return 0;
     __try {
@@ -1241,6 +1249,11 @@ static unsigned int mcode_from_player0(void)
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
     }
+}
+
+static unsigned int mcode_from_player0(void)
+{
+    return mcode_from_player(0);
 }
 
 static int player_for_option(ActorPtr opt)
@@ -1341,7 +1354,8 @@ static int read_u16(const void *base, uintptr_t off, unsigned int *out)
     }
 }
 
-static void cache_put(unsigned int mcode, int diff_idx, int core, int max_bpm, int min_bpm)
+static void cache_put(unsigned int mcode, int diff_idx, int core, int max_bpm,
+                      int min_bpm)
 {
     int i;
     static int logged_full;
@@ -1391,6 +1405,34 @@ static int cache_get(unsigned int mcode, int diff_idx, int *core, int *max_bpm, 
     return found;
 }
 
+/* Recover Core when (mcode,diff) missed — Mac often caches under a wrong key. */
+static int cache_get_by_max(unsigned int bpm_max, unsigned int bpm_min,
+                            int *core, int *max_bpm, int *min_bpm)
+{
+    int i;
+    int found = 0;
+
+    if (bpm_max == 0)
+        return 0;
+    EnterCriticalSection(&g_cache_cs);
+    for (i = 0; i < g_cache_count; i++) {
+        if (g_cache[i].core <= 0)
+            continue;
+        if ((unsigned)g_cache[i].max_bpm != bpm_max)
+            continue;
+        if (bpm_min > 0 && g_cache[i].min_bpm > 0 &&
+            (unsigned)g_cache[i].min_bpm != bpm_min)
+            continue;
+        *core = g_cache[i].core;
+        *max_bpm = g_cache[i].max_bpm;
+        *min_bpm = g_cache[i].min_bpm;
+        found = 1;
+        break;
+    }
+    LeaveCriticalSection(&g_cache_cs);
+    return found;
+}
+
 static void dur_add(DurBucket *buckets, int *n, int bpm, int duration)
 {
     int i;
@@ -1419,6 +1461,37 @@ static int chart_diff_idx(int difficulty, int is_dp)
     if (is_dp)
         return difficulty + 5;
     return difficulty;
+}
+
+/* Also store Core under each active player's music/diff (fixes Mac key miss). */
+static void cache_alias_to_players(int core, int max_bpm, int min_bpm)
+{
+    int p;
+
+    for (p = 0; p < 2; p++) {
+        void *po = player_obj(p);
+        unsigned int mcode = 0;
+        unsigned int diff = 0;
+        unsigned int style = 0;
+        int diff_idx;
+
+        if (!po)
+            continue;
+        __try {
+            mcode = *(unsigned int *)((char *)po + g_off_player_music);
+            diff = *(unsigned int *)((char *)po + g_off_player_diff);
+            if (g_off_player_style)
+                style = *(unsigned int *)((char *)po + g_off_player_style);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            continue;
+        }
+        if (!mcode_plausible(mcode))
+            continue;
+        diff_idx = chart_diff_idx((int)diff, style != 0);
+        cache_put(mcode, diff_idx, core, max_bpm, min_bpm);
+        if (diff_idx != (int)diff)
+            cache_put(mcode, (int)diff, core, max_bpm, min_bpm);
+    }
 }
 
 /*
@@ -1627,7 +1700,9 @@ static unsigned int resolve_note_parse_mcode(uintptr_t ret, void *ret_slot)
         if (!mcode_plausible(mcode))
             mcode = mcode_from_game();
         if (!mcode_plausible(mcode))
-            mcode = mcode_from_player0();
+            mcode = mcode_from_player(0);
+        if (!mcode_plausible(mcode))
+            mcode = mcode_from_player(1);
     }
 
     if (!mcode_plausible(mcode))
@@ -1636,7 +1711,8 @@ static unsigned int resolve_note_parse_mcode(uintptr_t ret, void *ret_slot)
 }
 
 static void cache_from_notes(char **notes, unsigned int mcode,
-                             unsigned int style_pass, int difficulty)
+                             unsigned int style_pass, int difficulty,
+                             int from_gameplay_parse)
 {
     char *begin;
     char *end;
@@ -1663,9 +1739,17 @@ static void cache_from_notes(char **notes, unsigned int mcode,
     }
 
     cache_put(mcode, diff_idx, core, max_bpm, min_bpm);
-    log_msg("analyze mcode=%u diff_idx=%d core=%d max=%d min=%d notes=%d",
-            mcode, diff_idx, core, max_bpm, min_bpm,
-            (int)((end - begin) / g_note_stride));
+    /* Alias under live player music IDs — parse mcode can be wrong on Wine. */
+    cache_alias_to_players(core, max_bpm, min_bpm);
+    if (from_gameplay_parse && core > 0) {
+        g_play_core = core;
+        g_play_max = max_bpm;
+        g_play_min = min_bpm;
+    }
+    log_msg_f("analyze mcode=%u diff_idx=%d core=%d max=%d min=%d notes=%d%s",
+              mcode, diff_idx, core, max_bpm, min_bpm,
+              (int)((end - begin) / g_note_stride),
+              from_gameplay_parse ? " (gameplay)" : "");
 }
 
 /*
@@ -1686,6 +1770,7 @@ static int chart_bpm_for_player(int player, int *out_bpm, const char **out_src,
     unsigned int bpm_min = 0;
     int core = 0, cmax = 0, cmin = 0;
     int diff_idx;
+    const char *how = NULL;
 
     *out_bpm = 0;
     *out_src = "none";
@@ -1712,18 +1797,19 @@ static int chart_bpm_for_player(int player, int *out_bpm, const char **out_src,
 
     diff_idx = chart_diff_idx((int)diff, style != 0);
 
-    if (cache_get(mcode, diff_idx, &core, &cmax, &cmin) && core > 0) {
+    if (cache_get(mcode, diff_idx, &core, &cmax, &cmin) && core > 0)
+        how = "core";
+    else if (diff_idx != (int)diff &&
+             cache_get(mcode, (int)diff, &core, &cmax, &cmin) && core > 0)
+        how = "core";
+    else if (cache_get(mcode, diff_idx == (int)diff ? diff + 5 : diff_idx,
+                       &core, &cmax, &cmin) &&
+             core > 0)
+        how = "core";
+
+    if (how) {
         *out_bpm = core;
-        *out_src = "core";
-        *out_max = (unsigned)(cmax > 0 ? cmax : core);
-        *out_min = (unsigned)(cmin > 0 ? cmin : core);
-        return 1;
-    }
-    /* If style offset wrong, still try plain diff / diff+5. */
-    if (diff_idx != (int)diff &&
-        cache_get(mcode, (int)diff, &core, &cmax, &cmin) && core > 0) {
-        *out_bpm = core;
-        *out_src = "core";
+        *out_src = how;
         *out_max = (unsigned)(cmax > 0 ? cmax : core);
         *out_min = (unsigned)(cmin > 0 ? cmin : core);
         return 1;
@@ -1742,6 +1828,27 @@ static int chart_bpm_for_player(int player, int *out_bpm, const char **out_src,
     read_u16(music, g_off_bpmmin, &bpm_min);
     *out_max = bpm_max;
     *out_min = bpm_min;
+
+    /* Mac: Core was cached under a different mcode — match by bpmmax/min. */
+    if (cache_get_by_max(bpm_max, bpm_min, &core, &cmax, &cmin) && core > 0) {
+        cache_put(mcode, diff_idx, core, cmax, cmin);
+        *out_bpm = core;
+        *out_src = "core";
+        *out_max = (unsigned)(cmax > 0 ? cmax : core);
+        *out_min = (unsigned)(cmin > 0 ? cmin : core);
+        return 1;
+    }
+    if (g_play_core > 0 && g_play_max > 0 &&
+        (unsigned)g_play_max == bpm_max &&
+        (bpm_min == 0 || g_play_min <= 0 ||
+         (unsigned)g_play_min == bpm_min)) {
+        cache_put(mcode, diff_idx, g_play_core, g_play_max, g_play_min);
+        *out_bpm = g_play_core;
+        *out_src = "core";
+        *out_max = (unsigned)g_play_max;
+        *out_min = (unsigned)(g_play_min > 0 ? g_play_min : g_play_core);
+        return 1;
+    }
 
     if (bpm_max > 0) {
         *out_bpm = (int)bpm_max;
@@ -2266,10 +2373,10 @@ static int __fastcall detour_gameplay_setup(ActorPtr gp, void *edx)
         int eq = chart_bpm > 0
                      ? (int)((double)chart_bpm * (double)speed + 0.5)
                      : m_bpm;
-        log_msg("GameplaySetup P%d m_bpm=%d chart=%d (%s) -> float %.3f "
-                "(eq %d) hud %d.%02dx idx %d",
-                (player >= 0 && player < 2) ? player + 1 : 0, m_bpm, chart_bpm,
-                src, speed, eq, hud_h / 100, hud_h % 100, index);
+        log_msg_f("GameplaySetup P%d m_bpm=%d chart=%d (%s) -> float %.3f "
+                  "(eq %d) hud %d.%02dx idx %d",
+                  (player >= 0 && player < 2) ? player + 1 : 0, m_bpm, chart_bpm,
+                  src, speed, eq, hud_h / 100, hud_h % 100, index);
     }
     apply_mmod_to_gameplay(gp, speed, index, "GameplaySetup");
     if (player >= 0 && player < 2) {
@@ -2393,7 +2500,8 @@ static char __stdcall detour_note_parse(void *reader, char **notes, void *extra,
     ok = g_orig_parse(reader, notes, extra, counts, density, style_pass,
                       difficulty, option);
     if (ok && mcode)
-        cache_from_notes(notes, mcode, style_pass, difficulty);
+        cache_from_notes(notes, mcode, style_pass, difficulty,
+                         ret_rva == g_rva_gameplay_parse_ret ? 1 : 0);
     else if (ok && !mcode && nlog <= 40 &&
              (ret_rva == g_rva_analyze_parse_ret ||
               ret_rva == g_rva_gameplay_parse_ret))
