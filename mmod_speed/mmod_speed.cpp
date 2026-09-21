@@ -22,6 +22,10 @@
  *  SPEED menu x-mod writes are ignored while enabled=1.
  *  In-song Menu Left/Right nudges live m_bpm by m_bpm_step (default 10),
  *  updates scroll + HUD, then restores each side's INI m_bpm when play ends.
+ *  Optional WORLD-style CONSTANT arrow visibility (INI constant=1): notes still
+ *  scroll via M-Mod, but draw is gated to a fixed display time (ms). Menu L/R
+ *  defaults to nudging m_bpm; Menu Left+Right chord toggles to constant_ms
+ *  (ONLINE appends " C####", with "*" while editing display time).
  *  During play, the green ONLINE label shows liveBPM (effective) via a
  *  retargeted string pointer (no D3D). One side: "150 BPM (600)". Both sides
  *  same live: "150 BPM (600 / 660)". Different live: "150 BPM (600) / 300 BPM
@@ -91,6 +95,13 @@ static const uintptr_t kOffGpSpeedTo = 0x26C;
 static const uintptr_t kOffGpSpeedIdx = 0x274;
 static const uintptr_t kOffGpPlayer = 0x84;
 static const uintptr_t kOffGpLiveBpm = 0x16C;
+/* Note-params child: CONSTANT flag +0xD0, display ms +0xD4 (gate 0x1DD00). */
+static const uintptr_t kOffGpNoteParams = 0x128;
+static const uintptr_t kOffNoteConstFlag = 0xD0;
+static const uintptr_t kOffNoteConstMs = 0xD4;
+/* Option fields copied into note params during GamePlay update case 0. */
+static const uintptr_t kOffOptionConstFlag = 0x64;
+static const uintptr_t kOffOptionConstMs = 0x68;
 static const uintptr_t kOffCsaOption = 0x90;
 static const uintptr_t kOffOptionIconOption = 0x60;
 static const uintptr_t kOffOptionHispeed = 0x0C;
@@ -114,7 +125,7 @@ static const uintptr_t kOffUiTextMid = 0x18;
 #define STOCK_ONLINE "ONLINE"
 #define STOCK_ONLINE_LEN 7
 typedef uintptr_t ActorPtr;
-/* option_copy is EDI=dst / ESI=src usercall — trampoline via asm only. */
+/* option_copy is EDI=dst / ESI=src usercall - trampoline via asm only. */
 typedef void *OptionCopyFn;
 typedef void *(*MusicLookupFn)(unsigned int mcode);
 /* thiscall fnptrs are OK; free-function detours use fastcall(self,edx) or naked. */
@@ -176,6 +187,13 @@ static const uintptr_t kOffGpSpeedIdx = 0x1E4;
 static const uintptr_t kOffGpPlayer = 0x6C;
 /* Live song BPM float +0xFC (helper 0xD9410, same role as 64-bit +0x16C). */
 static const uintptr_t kOffGpLiveBpm = 0xFC;
+/* Note-params child: CONSTANT flag +0xA0, display ms +0xA4 (gate 0x19830). */
+static const uintptr_t kOffGpNoteParams = 0xC4;
+static const uintptr_t kOffNoteConstFlag = 0xA0;
+static const uintptr_t kOffNoteConstMs = 0xA4;
+/* Option fields copied into note params during GamePlay update case 0. */
+static const uintptr_t kOffOptionConstFlag = 0x60;
+static const uintptr_t kOffOptionConstMs = 0x64;
 static const uintptr_t kOffCsaOption = 0x74;
 static const uintptr_t kOffOptionIconOption = 0x44;
 static const uintptr_t kOffOptionHispeed = 0x08;
@@ -232,11 +250,12 @@ static StatusHudFn g_orig_status_hud;
 static SetHispeedFn g_orig_set_hispeed;
 /* Active GamePlayActor per side (scroll floats live here, not on Option). */
 static ActorPtr g_gameplay[2];
-/* ControlSpeedActor per side — early Menu L/R + Option embed. */
+/* ControlSpeedActor per side - early Menu L/R + Option embed. */
 static ActorPtr g_csa[2];
-/* OptionIconActor per side — owns speed_x%03d graphic. */
+/* OptionIconActor per side - owns speed_x%03d graphic. */
 static ActorPtr g_option_icon[2];
 static volatile LONG g_ready;
+static volatile LONG g_shutdown;
 static volatile LONG g_note_parse_logs;
 
 static int g_log_enabled = 1;
@@ -247,6 +266,11 @@ static int g_online_hud = 1;
 static int g_m_bpm_ini[2] = {600, 600};
 static int g_m_bpm_live[2] = {600, 600};
 static int g_m_bpm_step = 10;
+/* WORLD-style CONSTANT display-time gate (orthogonal to M-Mod scroll). */
+static int g_constant = 1;
+static int g_constant_ms_ini[2] = {600, 600};
+static int g_constant_ms_live[2] = {600, 600};
+static int g_constant_ms_step = 10;
 /* Per-side chart BPM (core/max) for ratio + ONLINE effective. */
 static int g_chart_bpm_hud[2];
 /* Per-side: seen live tempo; held parity-rounded live / effective. */
@@ -254,7 +278,7 @@ static int g_seen_live_bpm[2];
 static int g_display_live_bpm[2];
 static int g_display_effective[2];
 /* Buffer the ONLINE string pointer is retargeted to. */
-static char g_online_text[56] = STOCK_ONLINE;
+static char g_online_text[80] = STOCK_ONLINE;
 /* Saved ONLINE patch bytes (lea disp or push imm) for restore. */
 static unsigned char g_online_lea_saved[4];
 static int g_online_lea_patched;
@@ -287,6 +311,9 @@ static uintptr_t g_rva_gameplay_vftable = kDefaultGameplayVftable;
 static int g_nudge_left_down[2];
 static int g_nudge_right_down[2];
 static DWORD g_nudge_next_ms[2];
+/* 1 = Menu L/R edits constant_ms; 0 = edits m_bpm (default). Chord L+R toggles. */
+static int g_nudge_edit_constant[2];
+static int g_nudge_chord_down[2];
 static uintptr_t g_off_bpmmax = kDefaultOffBpmMax;
 static uintptr_t g_off_bpmmin = kDefaultOffBpmMin;
 static uintptr_t g_off_player_option = kDefaultOffPlayerOption;
@@ -321,7 +348,7 @@ struct CoreBpmEntry {
 #define CORE_CACHE_MAX 4096
 static CoreBpmEntry g_cache[CORE_CACHE_MAX];
 static int g_cache_count;
-/* Last gameplay-parse Core — recovers Mac (mcode,diff) key mismatches. */
+/* Last gameplay-parse Core - recovers Mac (mcode,diff) key mismatches. */
 static int g_play_core;
 static int g_play_max;
 static int g_play_min;
@@ -588,30 +615,23 @@ static ActorPtr find_option_icon(ActorPtr gp)
 
 static void cache_csa_for_player(int player, ActorPtr gp)
 {
-    ActorPtr csa;
     if (player < 0 || player > 1 || !gp)
         return;
-    csa = find_csa_child(gp);
-    if (csa)
-        g_csa[player] = csa;
-    else if (g_csa[player] && !csa_alive(g_csa[player]))
-        g_csa[player] = 0;
+    /* Always replace: never retain a stale CSA after a miss. */
+    g_csa[player] = find_csa_child(gp);
 }
 
 static void cache_option_icon_for_player(int player, ActorPtr gp)
 {
-    ActorPtr icon;
     if (player < 0 || player > 1 || !gp)
         return;
-    icon = find_option_icon(gp);
-    if (icon)
-        g_option_icon[player] = icon;
-    else if (g_option_icon[player] && !option_icon_alive(g_option_icon[player]))
-        g_option_icon[player] = 0;
+    /* Always replace: never retain a stale OptionIcon after a miss. */
+    g_option_icon[player] = find_option_icon(gp);
 }
 
 /* Forward: exact scroll re-apply after graphic refresh (defined later). */
 static void reapply_exact_scroll(int player);
+static void apply_constant_gate(int player);
 
 /*
  * Force the on-screen speed_x%03d graphic via OptionIconActor (not CSA).
@@ -760,7 +780,7 @@ static int start_held(unsigned int player)
     return io_held(player, g_rva_get_start, kIoBitStart);
 }
 
-/* Either side — matches retry_exit, so cab START always suppresses nudge. */
+/* Either side - matches retry_exit, so cab START always suppresses nudge. */
 static int any_start_held(void)
 {
     return start_held(0) || start_held(1);
@@ -931,8 +951,9 @@ static void online_side_sample(int player, struct OnlineSide *out)
             live_f = (float)kBpmClampHi;
         out->live_bpm = stabilize_parity(&g_display_live_bpm[player],
                                          round_parity_bpm(live_f, want_odd));
-        out->effective =
-            (out->live_bpm * out->m_bpm + out->chart_ref / 2) / out->chart_ref;
+        out->effective = (int)(((long long)out->live_bpm * out->m_bpm +
+                                out->chart_ref / 2) /
+                               out->chart_ref);
         if (out->effective < 0)
             out->effective = 0;
         out->effective = stabilize_parity(
@@ -951,6 +972,7 @@ static void online_side_sample(int player, struct OnlineSide *out)
  *   one side:  "150 BPM (600)"
  *   both same live: "150 BPM (600 / 660)"
  *   both different live: "150 BPM (600) / 300 BPM (660)"
+ * With constant=1, append " C####" (or " C####/C####" if sides differ).
  * Redraw PASELI-white after stock green ONLINE paint.
  */
 static void refresh_online_text_buffer(void)
@@ -958,6 +980,7 @@ static void refresh_online_text_buffer(void)
     struct OnlineSide side[2];
     int n = 0;
     int a = -1;
+    char base[56];
 
     if (!g_online_hud) {
         memcpy(g_online_text, STOCK_ONLINE, STOCK_ONLINE_LEN);
@@ -982,18 +1005,42 @@ static void refresh_online_text_buffer(void)
 
     if (n <= 0) {
         memcpy(g_online_text, STOCK_ONLINE, STOCK_ONLINE_LEN);
-    } else if (n == 1) {
-        _snprintf_s(g_online_text, sizeof(g_online_text), _TRUNCATE,
-                    "%3d BPM (%d)", side[a].live_bpm, side[a].effective);
+        return;
+    }
+
+    if (n == 1) {
+        _snprintf_s(base, sizeof(base), _TRUNCATE, "%3d BPM (%d)",
+                    side[a].live_bpm, side[a].effective);
     } else if (side[0].live_bpm == side[1].live_bpm) {
-        /* Both alive — always 1P then 2P. */
-        _snprintf_s(g_online_text, sizeof(g_online_text), _TRUNCATE,
-                    "%3d BPM (%d / %d)", side[0].live_bpm, side[0].effective,
-                    side[1].effective);
+        /* Both alive - always 1P then 2P. */
+        _snprintf_s(base, sizeof(base), _TRUNCATE, "%3d BPM (%d / %d)",
+                    side[0].live_bpm, side[0].effective, side[1].effective);
     } else {
-        _snprintf_s(g_online_text, sizeof(g_online_text), _TRUNCATE,
+        _snprintf_s(base, sizeof(base), _TRUNCATE,
                     "%3d BPM (%d) / %3d BPM (%d)", side[0].live_bpm,
                     side[0].effective, side[1].live_bpm, side[1].effective);
+    }
+
+    if (!g_constant) {
+        _snprintf_s(g_online_text, sizeof(g_online_text), _TRUNCATE, "%s", base);
+        return;
+    }
+
+    if (n == 1) {
+        _snprintf_s(g_online_text, sizeof(g_online_text), _TRUNCATE, "%s C%d%s",
+                    base, g_constant_ms_live[a],
+                    g_nudge_edit_constant[a] ? "*" : "");
+    } else if (g_constant_ms_live[0] == g_constant_ms_live[1]) {
+        _snprintf_s(g_online_text, sizeof(g_online_text), _TRUNCATE, "%s C%d%s",
+                    base, g_constant_ms_live[0],
+                    (g_nudge_edit_constant[0] || g_nudge_edit_constant[1])
+                        ? "*"
+                        : "");
+    } else {
+        _snprintf_s(g_online_text, sizeof(g_online_text), _TRUNCATE,
+                    "%s C%d%s/C%d%s", base, g_constant_ms_live[0],
+                    g_nudge_edit_constant[0] ? "*" : "", g_constant_ms_live[1],
+                    g_nudge_edit_constant[1] ? "*" : "");
     }
 }
 
@@ -1090,53 +1137,60 @@ static int patch_online_lea(void)
         return 0;
     if (g_online_lea_patched)
         return 1;
-    site = (unsigned char *)(g_base + g_rva_online_lea);
-    if (!bytes_match(site, kOnlineLeaPrologue, sizeof(kOnlineLeaPrologue))) {
-        log_msg_f("ONLINE patch prologue mismatch at %X",
-                  (unsigned)g_rva_online_lea);
-        return 0;
-    }
+
+    __try {
+        site = (unsigned char *)(g_base + g_rva_online_lea);
+        if (!bytes_match(site, kOnlineLeaPrologue, sizeof(kOnlineLeaPrologue))) {
+            log_msg_f("ONLINE patch prologue mismatch at %X",
+                      (unsigned)g_rva_online_lea);
+            return 0;
+        }
 #ifdef _WIN64
-    rel = (intptr_t)g_online_text - (intptr_t)(site + 7);
-    if (rel != (intptr_t)(int)rel) {
-        log_msg_f("ONLINE lea reloc out of range");
-        return 0;
-    }
-    if (!VirtualProtect(site, 7, PAGE_EXECUTE_READWRITE, &old_prot)) {
-        log_msg_f("ONLINE lea VirtualProtect failed");
-        return 0;
-    }
-    g_online_lea_saved[0] = site[3];
-    g_online_lea_saved[1] = site[4];
-    g_online_lea_saved[2] = site[5];
-    g_online_lea_saved[3] = site[6];
-    site[3] = (unsigned char)(rel & 0xFF);
-    site[4] = (unsigned char)((rel >> 8) & 0xFF);
-    site[5] = (unsigned char)((rel >> 16) & 0xFF);
-    site[6] = (unsigned char)((rel >> 24) & 0xFF);
-    VirtualProtect(site, 7, old_prot, &tmp);
-    FlushInstructionCache(GetCurrentProcess(), site, 7);
+        rel = (intptr_t)g_online_text - (intptr_t)(site + 7);
+        if (rel != (intptr_t)(int)rel) {
+            log_msg_f("ONLINE lea reloc out of range");
+            return 0;
+        }
+        if (!VirtualProtect(site, 7, PAGE_EXECUTE_READWRITE, &old_prot)) {
+            log_msg_f("ONLINE lea VirtualProtect failed");
+            return 0;
+        }
+        g_online_lea_saved[0] = site[3];
+        g_online_lea_saved[1] = site[4];
+        g_online_lea_saved[2] = site[5];
+        g_online_lea_saved[3] = site[6];
+        site[3] = (unsigned char)(rel & 0xFF);
+        site[4] = (unsigned char)((rel >> 8) & 0xFF);
+        site[5] = (unsigned char)((rel >> 16) & 0xFF);
+        site[6] = (unsigned char)((rel >> 24) & 0xFF);
+        VirtualProtect(site, 7, old_prot, &tmp);
+        FlushInstructionCache(GetCurrentProcess(), site, 7);
 #else
-    /* push imm32 — rewrite absolute address to our buffer. */
-    if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &old_prot)) {
-        log_msg_f("ONLINE push VirtualProtect failed");
+        /* push imm32 - rewrite absolute address to our buffer. */
+        if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &old_prot)) {
+            log_msg_f("ONLINE push VirtualProtect failed");
+            return 0;
+        }
+        memcpy(g_online_lea_saved, site + 1, 4);
+        {
+            uintptr_t abs = (uintptr_t)g_online_text;
+            site[1] = (unsigned char)(abs & 0xFF);
+            site[2] = (unsigned char)((abs >> 8) & 0xFF);
+            site[3] = (unsigned char)((abs >> 16) & 0xFF);
+            site[4] = (unsigned char)((abs >> 24) & 0xFF);
+        }
+        VirtualProtect(site, 5, old_prot, &tmp);
+        FlushInstructionCache(GetCurrentProcess(), site, 5);
+#endif
+        g_online_lea_patched = 1;
+        log_msg_f("ONLINE patched %X -> g_online_text",
+                  (unsigned)g_rva_online_lea);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_online_lea_patched = 0;
+        log_msg_f("ONLINE patch fault at %X", (unsigned)g_rva_online_lea);
         return 0;
     }
-    memcpy(g_online_lea_saved, site + 1, 4);
-    {
-        uintptr_t abs = (uintptr_t)g_online_text;
-        site[1] = (unsigned char)(abs & 0xFF);
-        site[2] = (unsigned char)((abs >> 8) & 0xFF);
-        site[3] = (unsigned char)((abs >> 16) & 0xFF);
-        site[4] = (unsigned char)((abs >> 24) & 0xFF);
-    }
-    VirtualProtect(site, 5, old_prot, &tmp);
-    FlushInstructionCache(GetCurrentProcess(), site, 5);
-#endif
-    g_online_lea_patched = 1;
-    log_msg_f("ONLINE patched %X -> g_online_text",
-              (unsigned)g_rva_online_lea);
-    return 1;
 }
 
 static void restore_online_lea(void)
@@ -1152,25 +1206,31 @@ static void restore_online_lea(void)
 
     if (!g_online_lea_patched || !g_base || !g_rva_online_lea)
         return;
-    site = (unsigned char *)(g_base + g_rva_online_lea);
-    if (!VirtualProtect(site, (DWORD)nbytes, PAGE_EXECUTE_READWRITE,
-                        &old_prot)) {
-        log_msg_f("ONLINE restore VirtualProtect failed");
-        return;
-    }
+
+    __try {
+        site = (unsigned char *)(g_base + g_rva_online_lea);
+        if (!VirtualProtect(site, (DWORD)nbytes, PAGE_EXECUTE_READWRITE,
+                            &old_prot)) {
+            log_msg_f("ONLINE restore VirtualProtect failed");
+            g_online_lea_patched = 0;
+            return;
+        }
 #ifdef _WIN64
-    site[3] = g_online_lea_saved[0];
-    site[4] = g_online_lea_saved[1];
-    site[5] = g_online_lea_saved[2];
-    site[6] = g_online_lea_saved[3];
+        site[3] = g_online_lea_saved[0];
+        site[4] = g_online_lea_saved[1];
+        site[5] = g_online_lea_saved[2];
+        site[6] = g_online_lea_saved[3];
 #else
-    memcpy(site + 1, g_online_lea_saved, 4);
+        memcpy(site + 1, g_online_lea_saved, 4);
 #endif
-    VirtualProtect(site, (DWORD)nbytes, old_prot, &tmp);
-    FlushInstructionCache(GetCurrentProcess(), site, nbytes);
-    g_online_lea_patched = 0;
-    memcpy(g_online_text, STOCK_ONLINE, STOCK_ONLINE_LEN);
-    log_msg_f("ONLINE restored at %X", (unsigned)g_rva_online_lea);
+        VirtualProtect(site, (DWORD)nbytes, old_prot, &tmp);
+        FlushInstructionCache(GetCurrentProcess(), site, nbytes);
+        g_online_lea_patched = 0;
+        memcpy(g_online_text, STOCK_ONLINE, STOCK_ONLINE_LEN);
+        log_msg_f("ONLINE restored at %X", (unsigned)g_rva_online_lea);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_online_lea_patched = 0;
+    }
 }
 
 /*
@@ -1222,6 +1282,7 @@ static void nudge_reset_buttons(int player)
     g_nudge_left_down[player] = 0;
     g_nudge_right_down[player] = 0;
     g_nudge_next_ms[player] = 0;
+    g_nudge_chord_down[player] = 0;
 }
 
 static unsigned int mcode_from_game(void)
@@ -1325,6 +1386,14 @@ static int clamp_i(int v, int lo, int hi)
     return v;
 }
 
+/* WORLD CONSTANT display time: 100–3000 ms, snapped to 10 ms. */
+static int snap_constant_ms(int ms)
+{
+    ms = clamp_i(ms, 100, 3000);
+    ms = ((ms + 5) / 10) * 10;
+    return clamp_i(ms, 100, 3000);
+}
+
 static int round_bpm(double bpm)
 {
     return (int)floorf((float)bpm + 0.5f);
@@ -1405,7 +1474,7 @@ static int cache_get(unsigned int mcode, int diff_idx, int *core, int *max_bpm, 
     return found;
 }
 
-/* Recover Core when (mcode,diff) missed — Mac often caches under a wrong key. */
+/* Recover Core when (mcode,diff) missed - Mac often caches under a wrong key. */
 static int cache_get_by_max(unsigned int bpm_max, unsigned int bpm_min,
                             int *core, int *max_bpm, int *min_bpm)
 {
@@ -1739,7 +1808,7 @@ static void cache_from_notes(char **notes, unsigned int mcode,
     }
 
     cache_put(mcode, diff_idx, core, max_bpm, min_bpm);
-    /* Alias under live player music IDs — parse mcode can be wrong on Wine. */
+    /* Alias under live player music IDs - parse mcode can be wrong on Wine. */
     cache_alias_to_players(core, max_bpm, min_bpm);
     if (from_gameplay_parse && core > 0) {
         g_play_core = core;
@@ -1829,7 +1898,7 @@ static int chart_bpm_for_player(int player, int *out_bpm, const char **out_src,
     *out_max = bpm_max;
     *out_min = bpm_min;
 
-    /* Mac: Core was cached under a different mcode — match by bpmmax/min. */
+    /* Mac: Core was cached under a different mcode - match by bpmmax/min. */
     if (cache_get_by_max(bpm_max, bpm_min, &core, &cmax, &cmin) && core > 0) {
         cache_put(mcode, diff_idx, core, cmax, cmin);
         *out_bpm = core;
@@ -1866,7 +1935,7 @@ static int chart_bpm_for_player(int player, int *out_bpm, const char **out_src,
 /*
  * Exact Real Speed ratio for GamePlay floats (no 0.25 snap).
  * HUD index is nearest 0.25 step only (Option+0x0C assets).
- * player must be 0 or 1 — no P1 fallback for unknown sides.
+ * player must be 0 or 1 - no P1 fallback for unknown sides.
  */
 static float compute_mmod_speed_for_player(int player, int *out_index,
                                           int *out_bpm, const char **out_src)
@@ -1989,6 +2058,60 @@ static void reapply_exact_scroll(int player)
     apply_mmod_to_gameplay(g_gameplay[player], speed, index, "ReapplyExact");
 }
 
+/*
+ * Force WORLD-style CONSTANT gate on the note-params object under GamePlay.
+ * Does not touch M-Mod scroll floats. Stock GamePlay update may refresh these
+ * from Option; we re-assert after that path each frame.
+ */
+static void apply_constant_gate(int player)
+{
+    ActorPtr gp;
+    ActorPtr note;
+    void *po;
+    char *opt;
+    int ms;
+
+    if (player < 0 || player > 1 || !g_enabled || !g_ready || !g_constant)
+        return;
+    gp = g_gameplay[player];
+    if (!gp || !gameplay_alive(gp))
+        return;
+
+    ms = snap_constant_ms(g_constant_ms_live[player]);
+    g_constant_ms_live[player] = ms;
+
+    po = player_obj(player);
+    opt = NULL;
+    if (po) {
+        __try {
+            opt = (char *)po + g_off_player_option;
+            *(int *)(opt + (int)kOffOptionConstFlag) = 1;
+            *(int *)(opt + (int)kOffOptionConstMs) = ms;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            opt = NULL;
+        }
+    }
+
+    note = 0;
+    __try {
+        note = *(ActorPtr *)(gp + kOffGpNoteParams);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        note = 0;
+    }
+    if (!note || !ptr_ok((void *)note))
+        return;
+
+    __try {
+        volatile int probe = *(int *)(note + kOffNoteConstFlag);
+        (void)probe;
+        *(int *)(note + kOffNoteConstFlag) = 1;
+        *(int *)(note + kOffNoteConstMs) = ms;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        gameplay_slot_clear(player);
+    }
+    (void)opt;
+}
+
 static void maybe_reset_live_m_bpm(const char *why)
 {
     int p;
@@ -2006,8 +2129,19 @@ static void maybe_reset_live_m_bpm(const char *why)
     online_hud_reset();
     refresh_online_text_buffer();
 
-    /* Restore per-side INI m_bpm if a chart left live values dirty. */
-    if (g_m_bpm_live[0] == g_m_bpm_ini[0] && g_m_bpm_live[1] == g_m_bpm_ini[1])
+    /* Always drop chord/edit state when leaving play. */
+    for (p = 0; p < 2; p++) {
+        if (g_nudge_edit_constant[p]) {
+            log_msg("%s reset P%d nudge -> m_bpm", why, p + 1);
+            g_nudge_edit_constant[p] = 0;
+        }
+        nudge_reset_buttons(p);
+    }
+
+    /* Restore per-side INI m_bpm / constant_ms if a chart left live dirty. */
+    if (g_m_bpm_live[0] == g_m_bpm_ini[0] && g_m_bpm_live[1] == g_m_bpm_ini[1] &&
+        g_constant_ms_live[0] == g_constant_ms_ini[0] &&
+        g_constant_ms_live[1] == g_constant_ms_ini[1])
         return;
     if (InterlockedCompareExchange(&resetting, 1, 0) != 0)
         return;
@@ -2020,7 +2154,11 @@ static void maybe_reset_live_m_bpm(const char *why)
                 g_m_bpm_live[p] = g_m_bpm_ini[p];
                 changed = 1;
             }
-            nudge_reset_buttons(p);
+            if (g_constant_ms_live[p] != g_constant_ms_ini[p]) {
+                log_msg("%s reset P%d constant_ms %d -> ini %d", why, p + 1,
+                        g_constant_ms_live[p], g_constant_ms_ini[p]);
+                g_constant_ms_live[p] = g_constant_ms_ini[p];
+            }
         }
         if (changed) {
             for (p = 0; p < 2; p++) {
@@ -2039,6 +2177,24 @@ static void maybe_reset_live_m_bpm(const char *why)
     }
 }
 
+static void nudge_constant_ms(int player, int delta, const char *why)
+{
+    int before;
+    int after;
+
+    if (player < 0 || player > 1 || !delta || !g_constant)
+        return;
+    before = g_constant_ms_live[player];
+    after = snap_constant_ms(before + delta);
+    if (after == before)
+        return;
+    g_constant_ms_live[player] = after;
+    log_msg("%s P%d constant_ms %d -> %d (step %d)", why, player + 1, before,
+            after, delta);
+    apply_constant_gate(player);
+    refresh_online_text_buffer();
+}
+
 static void nudge_m_bpm(int player, int delta, const char *why)
 {
     int before;
@@ -2049,7 +2205,7 @@ static void nudge_m_bpm(int player, int delta, const char *why)
     if (player < 0 || player > 1 || !delta)
         return;
     before = g_m_bpm_live[player];
-    after = clamp_i(before + delta, 10, 1600);
+    after = clamp_i(before + delta, 10, 2000);
     if (after == before)
         return;
     po = player_obj(player);
@@ -2082,6 +2238,8 @@ static void poll_mmod_nudge(int player)
     int start;
     DWORD now;
     int delta = 0;
+    int step;
+    int edit_const;
 
     if (player < 0 || player > 1 || !g_enabled || !g_ready)
         return;
@@ -2090,6 +2248,8 @@ static void poll_mmod_nudge(int player)
     left = menu_left_held((unsigned)player);
     right = menu_right_held((unsigned)player);
     now = GetTickCount();
+    edit_const = g_constant && g_nudge_edit_constant[player];
+    step = edit_const ? g_constant_ms_step : g_m_bpm_step;
 
     /* Ignore while START held so retry_exit Start+MenuLeft select is safe. */
     if (start) {
@@ -2097,22 +2257,40 @@ static void poll_mmod_nudge(int player)
         return;
     }
 
+    /* Menu Left+Right chord: toggle nudge target (m_bpm <-> constant_ms). */
+    if (left && right) {
+        if (!g_nudge_chord_down[player]) {
+            if (g_constant) {
+                g_nudge_edit_constant[player] = !g_nudge_edit_constant[player];
+                log_msg("MenuChord P%d nudge -> %s", player + 1,
+                        g_nudge_edit_constant[player] ? "constant_ms" : "m_bpm");
+                refresh_online_text_buffer();
+            }
+            g_nudge_chord_down[player] = 1;
+        }
+        /* Hold both as "already down" so releasing one side cannot edge-nudge. */
+        g_nudge_left_down[player] = 1;
+        g_nudge_right_down[player] = 1;
+        return;
+    }
+    g_nudge_chord_down[player] = 0;
+
     if (left && !right) {
         if (!g_nudge_left_down[player]) {
-            delta = -g_m_bpm_step;
+            delta = -step;
             g_nudge_next_ms[player] = now + kNudgeRepeatFirstMs;
         } else if ((int)(now - g_nudge_next_ms[player]) >= 0) {
-            delta = -g_m_bpm_step;
+            delta = -step;
             g_nudge_next_ms[player] = now + kNudgeRepeatMs;
         }
         g_nudge_left_down[player] = 1;
         g_nudge_right_down[player] = 0;
     } else if (right && !left) {
         if (!g_nudge_right_down[player]) {
-            delta = g_m_bpm_step;
+            delta = step;
             g_nudge_next_ms[player] = now + kNudgeRepeatFirstMs;
         } else if ((int)(now - g_nudge_next_ms[player]) >= 0) {
-            delta = g_m_bpm_step;
+            delta = step;
             g_nudge_next_ms[player] = now + kNudgeRepeatMs;
         }
         g_nudge_right_down[player] = 1;
@@ -2121,7 +2299,11 @@ static void poll_mmod_nudge(int player)
         nudge_reset_buttons(player);
     }
 
-    if (delta)
+    if (!delta)
+        return;
+    if (edit_const)
+        nudge_constant_ms(player, delta, "MenuNudge");
+    else
         nudge_m_bpm(player, delta, "MenuNudge");
 }
 
@@ -2206,7 +2388,7 @@ static unsigned int __fastcall detour_get_hispeed(ActorPtr opt)
     }
 }
 #else
-/* Stock SetHispeed returns the index in EAX — callers may use it. */
+/* Stock SetHispeed returns the index in EAX - callers may use it. */
 static int set_hispeed_impl(ActorPtr opt, int index)
 {
     int written = index;
@@ -2270,18 +2452,18 @@ static __declspec(naked) unsigned int detour_get_hispeed(void)
 #ifdef _WIN64
 static ActorPtr __fastcall detour_option_copy(ActorPtr dst, ActorPtr src)
 {
-    ActorPtr result = 0;
+    ActorPtr result = dst;
 
     if (!g_orig_copy)
-        return 0;
+        return dst;
     result = g_orig_copy(dst, src);
 #else
 extern "C" void *__cdecl detour_option_copy_c(void *dst, void *src)
 {
-    void *result = NULL;
+    void *result = dst;
 
     if (!g_orig_copy)
-        return NULL;
+        return dst;
     result = call_orig_option_copy(g_orig_copy, dst, src);
 #endif
     if (g_ready && g_enabled) {
@@ -2380,6 +2562,7 @@ static int __fastcall detour_gameplay_setup(ActorPtr gp, void *edx)
     }
     apply_mmod_to_gameplay(gp, speed, index, "GameplaySetup");
     if (player >= 0 && player < 2) {
+        apply_constant_gate(player);
         cache_csa_for_player(player, gp);
         cache_option_icon_for_player(player, gp);
         refresh_speed_visual(player, index);
@@ -2433,8 +2616,10 @@ static ActorPtr __fastcall detour_gameplay_update(ActorPtr gp, void *edx)
         result = g_orig_gameplay_update(gp, edx);
 #endif
 
-    if (g_ready && g_enabled && alive && player >= 0 && player < 2)
+    if (g_ready && g_enabled && alive && player >= 0 && player < 2) {
         reapply_exact_scroll(player);
+        apply_constant_gate(player);
+    }
 
     return result;
 }
@@ -2548,13 +2733,19 @@ static void unpatch_option_vtable(void)
     void **vt;
     if (!g_vt_patched || !g_base)
         return;
-    vt = (void **)(g_base + g_rva_option_vftable);
-    if (!VirtualProtect(g_vt_set_slot, sz, PAGE_READWRITE, &old_prot))
-        return;
-    vt[3] = g_saved_vt_set;
-    vt[4] = g_saved_vt_get;
-    VirtualProtect(g_vt_set_slot, sz, old_prot, &old_prot);
-    g_vt_patched = 0;
+    __try {
+        vt = (void **)(g_base + g_rva_option_vftable);
+        if (!VirtualProtect(g_vt_set_slot, sz, PAGE_READWRITE, &old_prot)) {
+            g_vt_patched = 0;
+            return;
+        }
+        vt[3] = g_saved_vt_set;
+        vt[4] = g_saved_vt_get;
+        VirtualProtect(g_vt_set_slot, sz, old_prot, &old_prot);
+        g_vt_patched = 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_vt_patched = 0;
+    }
 }
 
 static void disable_installed_hooks(void)
@@ -2683,11 +2874,20 @@ static DWORD WINAPI init_thread(LPVOID)
 
     g_enabled = ini_int(L"enabled", 1);
     g_online_hud = ini_int(L"online_hud", 1);
-    g_m_bpm_ini[0] = clamp_i(ini_int(L"m_bpm_1p", 600), 10, 1600);
-    g_m_bpm_ini[1] = clamp_i(ini_int(L"m_bpm_2p", 600), 10, 1600);
+    g_m_bpm_ini[0] = clamp_i(ini_int(L"m_bpm_1p", 600), 10, 2000);
+    g_m_bpm_ini[1] = clamp_i(ini_int(L"m_bpm_2p", 600), 10, 2000);
     g_m_bpm_live[0] = g_m_bpm_ini[0];
     g_m_bpm_live[1] = g_m_bpm_ini[1];
     g_m_bpm_step = clamp_i(ini_int(L"m_bpm_step", 10), 1, 100);
+    g_constant = ini_int(L"constant", 1) ? 1 : 0;
+    g_constant_ms_ini[0] = snap_constant_ms(ini_int(L"constant_ms_1p", 600));
+    g_constant_ms_ini[1] = snap_constant_ms(ini_int(L"constant_ms_2p", 600));
+    g_constant_ms_live[0] = g_constant_ms_ini[0];
+    g_constant_ms_live[1] = g_constant_ms_ini[1];
+    g_constant_ms_step = clamp_i(ini_int(L"constant_ms_step", 10), 10, 100);
+    g_constant_ms_step = (g_constant_ms_step / 10) * 10;
+    if (g_constant_ms_step < 10)
+        g_constant_ms_step = 10;
     g_verify_prologue = ini_int(L"verify_prologue", 1);
     g_rva_option_copy = ini_rva(L"rva_option_copy", kDefaultOptionCopy);
     g_rva_music_lookup = ini_rva(L"rva_music_lookup", kDefaultMusicLookup);
@@ -2734,10 +2934,13 @@ static DWORD WINAPI init_thread(LPVOID)
     g_off_note_ms = ini_int(L"off_note_ms", kDefaultOffNoteMs);
 
     log_msg_f("init enabled=%d online_hud=%d m_bpm_1p=%d m_bpm_2p=%d step=%d "
+              "constant=%d cms1=%d cms2=%d cms_step=%d "
               "copy=%X analyze=%X parse=%X music=%X players=%X vt=%X gpvt=%X "
               "gpupd=%X icon=%X left=%X right=%X note=%d verify=%d",
               g_enabled, g_online_hud, g_m_bpm_ini[0], g_m_bpm_ini[1],
-              g_m_bpm_step, (unsigned)g_rva_option_copy,
+              g_m_bpm_step, g_constant, g_constant_ms_ini[0],
+              g_constant_ms_ini[1], g_constant_ms_step,
+              (unsigned)g_rva_option_copy,
               (unsigned)g_rva_ssq_analyze, (unsigned)g_rva_note_parse,
               (unsigned)g_rva_music_lookup, (unsigned)g_rva_players,
               (unsigned)g_rva_option_vftable, (unsigned)g_rva_gameplay_vftable,
@@ -2751,10 +2954,18 @@ static DWORD WINAPI init_thread(LPVOID)
         log_msg("early core hooks failed");
         return 0;
     }
+    if (InterlockedCompareExchange(&g_shutdown, 0, 0) != 0) {
+        disable_installed_hooks();
+        return 0;
+    }
 
     /* Phase 2: option_copy + vtable once that code is unpacked. */
     if (!wait_option_copy_unpacked()) {
         log_msg("timeout waiting for option_copy prologue");
+        disable_installed_hooks();
+        return 0;
+    }
+    if (InterlockedCompareExchange(&g_shutdown, 0, 0) != 0) {
         disable_installed_hooks();
         return 0;
     }
@@ -2893,10 +3104,19 @@ static DWORD WINAPI init_thread(LPVOID)
         log_msg_f("vtable patch failed (OptionCopy hook still active)");
     }
 
+    if (InterlockedCompareExchange(&g_shutdown, 0, 0) != 0) {
+        log_msg_f("shutdown during init - disabling hooks, not ready");
+        disable_installed_hooks();
+        unpatch_option_vtable();
+        return 0;
+    }
+
     InterlockedExchange(&g_ready, 1);
-    log_msg_f("ready (M-Mod 1p=%d 2p=%d step %d, Core from SSQ, cache=%d, "
-              "clamp 0.25x-8.00x)",
-              g_m_bpm_ini[0], g_m_bpm_ini[1], g_m_bpm_step, g_cache_count);
+    log_msg_f("ready (M-Mod 1p=%d 2p=%d step %d, constant=%d cms=%d/%d step %d, "
+              "Core from SSQ, cache=%d, clamp 0.25x-8.00x)",
+              g_m_bpm_ini[0], g_m_bpm_ini[1], g_m_bpm_step, g_constant,
+              g_constant_ms_ini[0], g_constant_ms_ini[1], g_constant_ms_step,
+              g_cache_count);
 
     /* Sanity: M600 / 150 = 4.00x index 15; M600 / 200 = 3.00x index 11 */
     {
@@ -2931,8 +3151,9 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID reserved)
          * Do NOT MH_Uninitialize / fclose / DeleteCS here: game threads may
          * still be inside detours or log_msg under the loader lock. Spice
          * keeps -k DLLs for process lifetime; restore Option vtable + ONLINE
-         * lea only.
+         * lea only. g_shutdown blocks a late init_thread from setting ready.
          */
+        InterlockedExchange(&g_shutdown, 1);
         InterlockedExchange(&g_ready, 0);
         restore_online_lea();
         unpatch_option_vtable();
